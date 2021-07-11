@@ -26,18 +26,12 @@ def jensen_shannon():
 
 
 def focal_loss(
-    alpha=0.25,
-    gamma=2.00,
-    epsilon=1e-7,
-    from_logits=False,
-    inner=tf.keras.losses.binary_crossentropy,
+    alpha=0.25, gamma=2.00, epsilon=1e-7, inner=tf.keras.losses.binary_crossentropy
 ):
     @tf.function
     def loss(y, p):
         y = tf.math.maximum(tf.cast(y, tf.float32), epsilon)
         p = tf.math.maximum(tf.cast(p, tf.float32), epsilon)
-        if from_logits:
-            p = tf.nn.sigmoid(p)
         base = inner(y, p)[:, None]
         negative = p * y + (1 - p) * (1 - y)
         positive = alpha * y + (1 - alpha) * (1 - y)
@@ -58,11 +52,13 @@ def make_adaptive(inner, num_channels=len(tags)):
     return loss
 
 
-def preprocessor(image_shape, num_tags=len(tags)):
+def preprocessor(image_shape, num_tags=len(tags), crop=False):
     def preprocess(x, y):
         x = tf.io.decode_image(tf.squeeze(x), expand_animations=False)
         x = tf.cast(x, tf.float32)
         x = x[..., : image_shape[-1]]
+        if crop and tf.reduce_all(tf.shape(x) > image_shape):
+            x = tf.image.random_crop(x, image_shape)
         if tf.shape(x)[-1] < 3:
             x = tf.reduce_mean(x, axis=-1)
             x = tf.expand_dims(x, axis=-1)
@@ -145,57 +141,55 @@ def fwd_attention_head(x, out_units=len(tags)):
     x = tf.keras.layers.LocallyConnected2D(*x.shape[-2:][::-1])(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Flatten()(x)
-    x = heteroscedastic.MCSigmoidDenseFA(
+    return heteroscedastic.MCSigmoidDenseFA(
         out_units,
         logits_only=True,
         name="denoising",
     )(x)
-    return tf.keras.layers.Activation(tf.nn.sigmoid, name="enc_tags")(x)
 
 
 def res_attention_head(x, enc_units=512, out_units=len(tags)):
-    dsampled = tf.keras.layers.BatchNormalization()(x)
-
+    dsampled = tf.keras.layers.LayerNormalization()(x)
+    conv_cfg = dict(
+        filters=dsampled.shape[3],
+        kernel_size=max(dsampled.shape[1:3]),
+        strides=min(dsampled.shape[1:3]) // 2,
+    )
     attended = tf.keras.layers.MultiHeadAttention(2, 2)(dsampled, dsampled)
-    attended = tf.keras.layers.LocallyConnected2D(*attended.shape[-2:][::-1])(attended)
+    attended = tf.keras.layers.SeparableConv2D(**conv_cfg)(attended)
 
-    squeezed = tf.keras.layers.LocallyConnected2D(*dsampled.shape[-2:][::-1])(dsampled)
-    squeezed = tf.keras.layers.Dense(enc_units)(squeezed)
+    dsampled = tf.keras.layers.SeparableConv2D(**conv_cfg)(dsampled)
+    squeezed = tf.keras.layers.Dense(enc_units)(dsampled)
     squeezed = tf.keras.layers.Activation(tf.nn.silu)(squeezed)
     squeezed = tf.keras.layers.Dense(attended.shape[-1])(squeezed)
 
     outputs = tf.keras.layers.Add()([squeezed, attended])
     outputs = tf.keras.layers.LayerNormalization()(outputs)
     outputs = tf.keras.layers.Flatten()(outputs)
-    outputs = heteroscedastic.MCSigmoidDenseFA(
-        out_units,
-        logits_only=True,
-        name="denoising",
+    logits = heteroscedastic.MCSigmoidDenseFA(
+        out_units, name="denoising", logits_only=True, temperature=4.0
     )(outputs)
-    return tf.keras.layers.Activation(tf.nn.sigmoid, name="enc_tags")(outputs)
+    return tf.keras.layers.Activation(tf.nn.sigmoid)(logits)
 
 
 def build_model(num_tags=len(tags)):
     image_shape = (224, 224, 3)
+    inputs = tf.keras.layers.Input(shape=image_shape, name="images")
     preprocess = tf.keras.Sequential(
         [
             tf.keras.layers.experimental.preprocessing.RandomFlip(),
             tf.keras.layers.experimental.preprocessing.RandomContrast(0.25),
             tf.keras.layers.experimental.preprocessing.RandomRotation(0.25),
-            tf.keras.layers.experimental.preprocessing.RandomZoom(-0.25),
             tf.keras.layers.experimental.preprocessing.Resizing(*image_shape[:-1]),
             tf.keras.layers.Lambda(tf.keras.applications.resnet.preprocess_input),
         ],
         name="preprocess",
     )
-    inputs = tf.keras.layers.Input(shape=image_shape, name="images")
     outputs = preprocess(inputs)
-    outputs = dd.model.create_resnet_custom_v4(outputs, output_dim=num_tags * 2)
-    outputs = tf.keras.Model(inputs, outputs).layers[-3].output
-    # outputs = tf.keras.applications.EfficientNetB0(
-    #     weights=None, include_top=False, input_shape=image_shape
-    # )(outputs)
-    outputs = res_attention_head(outputs)
+    outputs = tf.keras.applications.EfficientNetB0(
+        weights=None, include_top=False, input_shape=image_shape
+    )(outputs)
+    outputs = res_attention_head(outputs, out_units=num_tags)
     return tf.keras.Model(inputs, outputs)
 
 
@@ -234,11 +228,11 @@ if __name__ == "__main__":
     n_logs = len(tf.io.gfile.glob("./logs/*"))
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            "./train/e6tag_sm-{epoch:05}-{auc:.2f}.h5",
+            "./train/e6tag_sm-{epoch:05}-{auc:.2f}.ckpt",
             monitor="auc",
             mode="max",
             save_best_only=False,
-            save_weights_only=False,
+            save_weights_only=True,
             save_freq=1024,
         ),
         tf.keras.callbacks.TensorBoard(
@@ -250,27 +244,21 @@ if __name__ == "__main__":
     ]
 
     initial_epoch = 0
-    ckpts = sorted(tf.io.gfile.glob("./train/e6tag_sm-*.h5"))
-    if ckpts:
-        best = ckpts[-1]
-        model.load_weights(best)
-        initial_epoch, _ = os.path.splitext(best.split("-")[1])
+    if ckpt := tf.train.latest_checkpoint("./train"):
+        model.load_weights(ckpt)
+        initial_epoch, _ = os.path.splitext(ckpt.split("-")[1])
         initial_epoch = int(initial_epoch) - 1
 
-    # test_ds, train_ds = (
-    #     dataset.take(1024).cache().repeat().batch(4),
-    #     dataset.batch(1),
-    # )
     shards = shard_names("D:/yiff")  # [::2][:64]
-    batch_size = 12
+    batch_size = 16
     dataset = make_dataset(shards, image_shape).batch(batch_size)
     metrics = [
         tf.keras.metrics.AUC(name="auc"),
     ]
 
     shard_size = 256
-    total_epochs = 4
-    steps_per_epoch = int(len(shards) * shard_size / batch_size / total_epochs)
+    total_epochs = 8
+    steps_per_epoch = int(2 ** 16 / batch_size / total_epochs)
     lr_schedule = CycleSchedule(0.1, 4.0, steps_per_epoch * total_epochs, cycles=1)
     train_config = dict(
         x=dataset,
