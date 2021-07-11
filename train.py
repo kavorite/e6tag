@@ -101,7 +101,7 @@ def shard_names(root):
     return tf.io.gfile.glob(f"{root}/*.tfrecords")
 
 
-def read_records(shards):
+def read_records(shards, shard_length=256, concurrency=1):
     return (
         tf.data.Dataset.from_tensor_slices(shards)
         .shuffle(len(shards))
@@ -114,8 +114,8 @@ def read_records(shards):
                 )
             ),
             cycle_length=1,
-            block_length=256,
-            num_parallel_calls=1,
+            block_length=shard_length,
+            num_parallel_calls=concurrency,
             deterministic=False,
         )
         .prefetch(tf.data.AUTOTUNE)
@@ -141,14 +141,15 @@ def fwd_attention_head(x, out_units=len(tags)):
     x = tf.keras.layers.LocallyConnected2D(*x.shape[-2:][::-1])(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Flatten()(x)
-    return heteroscedastic.MCSigmoidDenseFA(
+    x = heteroscedastic.MCSigmoidDenseFA(
         out_units,
         logits_only=True,
         name="denoising",
     )(x)
+    return tf.keras.layers.Activation(tf.nn.sigmoid)(x)
 
 
-def res_attention_head(x, enc_units=512, out_units=len(tags)):
+def res_attention_head(x, enc_units=512, out_units=len(tags), denoise=True):
     dsampled = tf.keras.layers.LayerNormalization()(x)
     conv_cfg = dict(
         filters=dsampled.shape[3],
@@ -166,13 +167,16 @@ def res_attention_head(x, enc_units=512, out_units=len(tags)):
     outputs = tf.keras.layers.Add()([squeezed, attended])
     outputs = tf.keras.layers.LayerNormalization()(outputs)
     outputs = tf.keras.layers.Flatten()(outputs)
-    logits = heteroscedastic.MCSigmoidDenseFA(
-        out_units, name="denoising", logits_only=True, temperature=4.0
-    )(outputs)
+    if denoise:
+        logits = heteroscedastic.ExactSigmoidDense(
+            out_units, name="denoising", logits_only=True
+        )(outputs)
+    else:
+        logits = tf.keras.layers.Dense(out_units)(outputs)
     return tf.keras.layers.Activation(tf.nn.sigmoid)(logits)
 
 
-def build_model(num_tags=len(tags)):
+def build_model(num_tags=len(tags), denoise=True):
     image_shape = (224, 224, 3)
     inputs = tf.keras.layers.Input(shape=image_shape, name="images")
     preprocess = tf.keras.Sequential(
@@ -189,7 +193,7 @@ def build_model(num_tags=len(tags)):
     outputs = tf.keras.applications.EfficientNetB0(
         weights=None, include_top=False, input_shape=image_shape
     )(outputs)
-    outputs = res_attention_head(outputs, out_units=num_tags)
+    outputs = res_attention_head(outputs, out_units=num_tags, denoise=denoise)
     return tf.keras.Model(inputs, outputs)
 
 
