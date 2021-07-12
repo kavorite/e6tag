@@ -2,16 +2,14 @@ import os
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-import os
-
 import tensorflow as tf
-import tensorflow_addons as tfa
 
 import heteroscedastic
 from DeepDanbooru.deepdanbooru import deepdanbooru as dd
+from download import SHARD_LENGTH, SHARD_ROOT
 from robust_loss.adaptive import AdaptiveLossFunction
 
-with open("./tags.txt", encoding="utf8") as istrm:
+with tf.io.gfile.GFile(f"{SHARD_ROOT}/tags.txt") as istrm:
     tags = istrm.read().split()
 
 
@@ -84,6 +82,10 @@ def record_parser():
     return parse
 
 
+def shard_names(root=SHARD_ROOT):
+    return tf.io.gfile.glob(f"{root}/*.tfrecords")
+
+
 def record_deserializer(num_tags=len(tags)):
     @tf.function
     def decode(record):
@@ -97,11 +99,7 @@ def record_deserializer(num_tags=len(tags)):
     return decode
 
 
-def shard_names(root):
-    return tf.io.gfile.glob(f"{root}/*.tfrecords")
-
-
-def read_records(shards, shard_length=256, concurrency=1):
+def read_records(shards, shard_length=SHARD_LENGTH):
     return (
         tf.data.Dataset.from_tensor_slices(shards)
         .shuffle(len(shards))
@@ -115,20 +113,20 @@ def read_records(shards, shard_length=256, concurrency=1):
             ),
             cycle_length=1,
             block_length=shard_length,
-            num_parallel_calls=concurrency,
+            num_parallel_calls=1,
             deterministic=False,
         )
         .prefetch(tf.data.AUTOTUNE)
     )
 
 
-def make_dataset(shards, image_shape, num_tags=len(tags)):
+def make_dataset(image_shape, shards=shard_names(SHARD_ROOT), num_tags=len(tags)):
     return (
         read_records(shards)
         .map(record_deserializer(num_tags))
         .map(
             preprocessor(image_shape, num_tags=num_tags),
-            num_parallel_calls=4,
+            num_parallel_calls=os.cpu_count(),
             deterministic=False,
         )
         .apply(tf.data.experimental.ignore_errors())
@@ -137,11 +135,10 @@ def make_dataset(shards, image_shape, num_tags=len(tags)):
 
 def fwd_attention_head(x, out_units=len(tags)):
     x = tf.keras.layers.MultiHeadAttention(2, 2)(x, x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.LocallyConnected2D(*x.shape[-2:][::-1])(x)
-    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.SeparableConv2D(*x.shape[-2:][::-1])(x)
+    x = tf.keras.layers.LayerNormalization()(x)
     x = tf.keras.layers.Flatten()(x)
-    x = heteroscedastic.MCSigmoidDenseFA(
+    x = heteroscedastic.ExactSigmoidDense(
         out_units,
         logits_only=True,
         name="denoising",
@@ -149,34 +146,26 @@ def fwd_attention_head(x, out_units=len(tags)):
     return tf.keras.layers.Activation(tf.nn.sigmoid)(x)
 
 
-def res_attention_head(x, enc_units=512, out_units=len(tags), denoise=True):
-    dsampled = tf.keras.layers.LayerNormalization()(x)
-    conv_cfg = dict(
-        filters=dsampled.shape[3],
-        kernel_size=max(dsampled.shape[1:3]),
-        strides=min(dsampled.shape[1:3]) // 2,
-    )
-    attended = tf.keras.layers.MultiHeadAttention(2, 2)(dsampled, dsampled)
-    attended = tf.keras.layers.SeparableConv2D(**conv_cfg)(attended)
+def res_attention_head(x, enc_units=512, out_units=len(tags)):
+    x = tf.keras.layers.LayerNormalization()(x)
+    attended = tf.keras.layers.MultiHeadAttention(2, 2)(x, x)
+    attended = tf.keras.layers.SeparableConv2D(*x.shape[-2:][::-1])(attended)
 
-    dsampled = tf.keras.layers.SeparableConv2D(**conv_cfg)(dsampled)
-    squeezed = tf.keras.layers.Dense(enc_units)(dsampled)
+    squeezed = tf.keras.layers.SeparableConv2D(*x.shape[-2:][::-1])(x)
+    squeezed = tf.keras.layers.Dense(enc_units)(squeezed)
     squeezed = tf.keras.layers.Activation(tf.nn.silu)(squeezed)
     squeezed = tf.keras.layers.Dense(attended.shape[-1])(squeezed)
 
     outputs = tf.keras.layers.Add()([squeezed, attended])
     outputs = tf.keras.layers.LayerNormalization()(outputs)
     outputs = tf.keras.layers.Flatten()(outputs)
-    if denoise:
-        logits = heteroscedastic.ExactSigmoidDense(
-            out_units, name="denoising", logits_only=True
-        )(outputs)
-    else:
-        logits = tf.keras.layers.Dense(out_units)(outputs)
+    logits = heteroscedastic.ExactSigmoidDense(
+        out_units, name="denoising", logits_only=True
+    )(outputs)
     return tf.keras.layers.Activation(tf.nn.sigmoid)(logits)
 
 
-def build_model(num_tags=len(tags), denoise=True):
+def build_model(num_tags=len(tags)):
     image_shape = (224, 224, 3)
     inputs = tf.keras.layers.Input(shape=image_shape, name="images")
     preprocess = tf.keras.Sequential(
@@ -193,7 +182,9 @@ def build_model(num_tags=len(tags), denoise=True):
     outputs = tf.keras.applications.EfficientNetB0(
         weights=None, include_top=False, input_shape=image_shape
     )(outputs)
-    outputs = res_attention_head(outputs, out_units=num_tags, denoise=denoise)
+    outputs = res_attention_head(
+        outputs, out_units=num_tags, enc_units=outputs.shape[-1] // 2
+    )
     return tf.keras.Model(inputs, outputs)
 
 
@@ -253,19 +244,23 @@ if __name__ == "__main__":
         initial_epoch, _ = os.path.splitext(ckpt.split("-")[1])
         initial_epoch = int(initial_epoch) - 1
 
-    shards = shard_names("D:/yiff")  # [::2][:64]
     batch_size = 16
-    dataset = make_dataset(shards, image_shape).batch(batch_size)
+    total_epochs = 2
+    shards = shard_names()
+    dataset = make_dataset(image_shape, shards).batch(batch_size)
     metrics = [
         tf.keras.metrics.AUC(name="auc"),
     ]
 
-    shard_size = 256
-    total_epochs = 8
-    steps_per_epoch = int(2 ** 16 / batch_size / total_epochs)
+    steps_per_epoch = int(len(shards) * SHARD_LENGTH / batch_size)
     lr_schedule = CycleSchedule(0.1, 4.0, steps_per_epoch * total_epochs, cycles=1)
-    train_config = dict(
-        x=dataset,
+    model.compile(
+        optimizer=tf.keras.optimizers.SGD(learning_rate=lr_schedule, momentum=0.99),
+        loss=make_adaptive(focal_loss()),
+        metrics=metrics,
+    )
+    model.fit(
+        dataset,
         verbose=1,
         epochs=total_epochs,
         initial_epoch=initial_epoch,
@@ -273,9 +268,3 @@ if __name__ == "__main__":
         steps_per_epoch=steps_per_epoch,
         shuffle=False,
     )
-    model.compile(
-        optimizer=tf.keras.optimizers.SGD(learning_rate=lr_schedule, momentum=0.99),
-        loss=make_adaptive(focal_loss()),
-        metrics=metrics,
-    )
-    model.fit(**train_config)
